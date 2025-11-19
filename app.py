@@ -353,13 +353,112 @@ def process_citation_tracker(file_path):
         
         print(f"Loaded {len(df)} rows from citation tracker")
         
+        # Calculate citation metrics
+        total_citations = len(df)
+        
+        # If there's a date column, calculate trend
+        citation_trend = {}
+        if 'date' in df.columns or 'analysis_date' in df.columns:
+            date_col = 'date' if 'date' in df.columns else 'analysis_date'
+            df[date_col] = pd.to_datetime(df[date_col])
+            
+            daily_citations = df.groupby(date_col).size().reset_index(name='count')
+            daily_citations = daily_citations.sort_values(date_col)
+            
+            citation_trend = {
+                'dates': daily_citations[date_col].dt.strftime('%Y-%m-%d').tolist(),
+                'counts': daily_citations['count'].tolist()
+            }
+            
+            # Latest week citations
+            if len(daily_citations) > 0:
+                latest_date = daily_citations[date_col].max()
+                week_ago = latest_date - timedelta(days=7)
+                latest_citations = len(df[df[date_col] >= week_ago])
+            else:
+                latest_citations = 0
+        else:
+            latest_citations = 0
+        
         return {
             'success': True,
-            'total_citations': len(df)
+            'total_citations': total_citations,
+            'latest_citations': latest_citations,
+            'citation_trend': citation_trend
         }
         
     except Exception as e:
         print(f"Error processing citation tracker: {str(e)}")
+        return {'success': False, 'error': str(e)}
+
+def process_perception(file_path):
+    """Process brand perception file"""
+    try:
+        if file_path.endswith('.csv'):
+            df = pd.read_csv(file_path)
+        else:
+            df = pd.read_excel(file_path)
+        
+        print(f"Loaded {len(df)} rows from perception data")
+        
+        # Calculate overall perception score
+        if 'score' in df.columns:
+            overall_score = df['score'].mean()
+        else:
+            overall_score = None
+        
+        # Get attributes with scores
+        attributes = []
+        if 'attribute' in df.columns and 'score' in df.columns:
+            attr_scores = df.groupby('attribute')['score'].mean().reset_index()
+            attr_scores = attr_scores.sort_values('score', ascending=False)
+            
+            for _, row in attr_scores.iterrows():
+                attributes.append({
+                    'attribute': row['attribute'],
+                    'score': round(row['score'], 2),
+                    'change': 0  # Would need historical data to calculate
+                })
+        
+        return {
+            'success': True,
+            'overall_score': round(overall_score, 2) if overall_score else None,
+            'attributes': attributes
+        }
+        
+    except Exception as e:
+        print(f"Error processing perception data: {str(e)}")
+        return {'success': False, 'error': str(e)}
+
+def process_events_log(file_path):
+    """Process events log file"""
+    try:
+        if file_path.endswith('.csv'):
+            df = pd.read_csv(file_path)
+        else:
+            df = pd.read_excel(file_path)
+        
+        print(f"Loaded {len(df)} rows from events log")
+        
+        # Get recent events
+        events = []
+        if 'date' in df.columns and 'description' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date', ascending=False)
+            
+            for _, row in df.head(20).iterrows():  # Get last 20 events
+                events.append({
+                    'date': row['date'].strftime('%Y-%m-%d'),
+                    'description': row['description']
+                })
+        
+        return {
+            'success': True,
+            'events': events
+        }
+        
+    except Exception as e:
+        print(f"Error processing events log: {str(e)}")
         return {'success': False, 'error': str(e)}
 
 # API Routes
@@ -386,7 +485,9 @@ def upload_files():
             'brand_presence': process_brand_presence,
             'sources_full': lambda f: process_sources_file(f, 'full'),
             'sources_detailed': lambda f: process_sources_file(f, 'detailed'),
-            'citation_tracker': process_citation_tracker
+            'citation_tracker': process_citation_tracker,
+            'perception': process_perception,
+            'events_log': process_events_log
         }
         
         for file_key, process_func in file_types.items():
