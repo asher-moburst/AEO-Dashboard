@@ -8,7 +8,7 @@ from werkzeug.utils import secure_filename
 import numpy as np
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend to connect
+CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins
 
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
