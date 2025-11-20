@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 import pandas as pd
 import json
@@ -8,7 +8,17 @@ from werkzeug.utils import secure_filename
 import numpy as np
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins
+
+# CORS Configuration - Allow requests from Loveable
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["*"],  # In production, replace with your Loveable domain
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"],
+        "expose_headers": ["Content-Type"],
+        "supports_credentials": False
+    }
+})
 
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
@@ -33,7 +43,26 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def process_brand_presence(file_path):
-    """Process the brand presence file with raw query data"""
+    """Process the brand presence file with raw query data
+    
+    Brand Presence Calculation:
+    - Each row in the input file represents one prompt response (query result)
+    - is_present = True/False indicates if brand was mentioned in that response
+    - Brand presence % = (# responses with brand mention) / (total # responses) * 100
+    - This is calculated using .mean() on boolean is_present field:
+      * .mean() on booleans gives the proportion of True values (0.0 to 1.0)
+      * Multiply by 100 to get percentage
+    - Calculated separately for:
+      * Overall (all LLMs, all topics, by week)
+      * Per LLM (by week)
+      * Per Topic (by week)
+      * Per LLM + Topic combination (by week)
+    
+    Example: If on 2024-01-01 there were 10 queries for ChatGPT on "AI Safety":
+      - 3 mentioned the brand (is_present=True)
+      - 7 did not (is_present=False)
+      - Brand presence = 3/10 * 100 = 30.0%
+    """
     import json
     from collections import Counter, defaultdict
     
@@ -93,7 +122,7 @@ def process_brand_presence(file_path):
         df['week_start'] = df['analysis_date']
         df['is_present'] = df['is_present'].astype(bool)
         
-        # Calculate brand presence percentage by actual date
+        # Overall daily trend
         weekly_trend = df.groupby('analysis_date').agg({
             'is_present': 'mean'
         }).reset_index()
@@ -129,219 +158,270 @@ def process_brand_presence(file_path):
             week_change = 0
             latest_date = weekly_trend.iloc[-1]['week_start'] if len(weekly_trend) > 0 else None
         
-        # LLM-specific metrics
-        llm_metrics = []
-        for llm in df['llm_name'].unique():
-            llm_df = df[df['llm_name'] == llm]
-            
-            llm_trend = llm_df.groupby('analysis_date').agg({
+        # LLM breakdown for the latest week
+        if latest_date is not None:
+            latest_llm_data = df[df['analysis_date'] == latest_date].groupby('llm_name').agg({
                 'is_present': 'mean'
             }).reset_index()
-            
-            if len(llm_trend) >= 2:
-                last = llm_trend.iloc[-1]
-                prev = llm_trend.iloc[-2]
-                llm_current = last['is_present'] * 100
-                llm_prev = prev['is_present'] * 100
-                llm_change = llm_current - llm_prev
-            else:
-                llm_current = llm_trend.iloc[-1]['is_present'] * 100 if len(llm_trend) > 0 else 0
-                llm_change = 0
-            
-            # Average rank when present
-            present_df = llm_df[llm_df['is_present'] == True]
-            avg_rank = present_df['rank'].mean() if len(present_df) > 0 else None
-            
-            llm_metrics.append({
-                'llm': llm,
-                'presence': round(llm_current, 1),
-                'change': round(llm_change, 1),
-                'avg_rank': round(avg_rank, 2) if avg_rank else None
-            })
+            latest_llm_data['brand_presence'] = latest_llm_data['is_present'] * 100
+            latest_llm_data = latest_llm_data.sort_values('brand_presence', ascending=False)
+        else:
+            latest_llm_data = pd.DataFrame()
         
-        # Topic analysis
-        topic_metrics = []
-        if 'topic' in df.columns:
-            for topic in df['topic'].unique():
-                if pd.isna(topic):
-                    continue
-                    
-                topic_df = df[df['topic'] == topic]
-                
-                topic_trend = topic_df.groupby('analysis_date').agg({
-                    'is_present': 'mean'
-                }).reset_index()
-                
-                if len(topic_trend) >= 2:
-                    last = topic_trend.iloc[-1]
-                    prev = topic_trend.iloc[-2]
-                    topic_current = last['is_present'] * 100
-                    topic_prev = prev['is_present'] * 100
-                    topic_change = topic_current - topic_prev
-                else:
-                    topic_current = topic_trend.iloc[-1]['is_present'] * 100 if len(topic_trend) > 0 else 0
-                    topic_change = 0
-                
-                topic_metrics.append({
-                    'topic': topic,
-                    'presence': round(topic_current, 1),
-                    'change': round(topic_change, 1)
-                })
+        # Topic breakdown for the latest week
+        if latest_date is not None:
+            latest_topic_data = df[df['analysis_date'] == latest_date].groupby('topic').agg({
+                'is_present': 'mean'
+            }).reset_index()
+            latest_topic_data['brand_presence'] = latest_topic_data['is_present'] * 100
+            latest_topic_data = latest_topic_data.sort_values('brand_presence', ascending=False)
+        else:
+            latest_topic_data = pd.DataFrame()
         
-        # Topic by LLM analysis
+        # Topic performance over time
+        topic_weekly_trend = df.groupby(['analysis_date', 'topic']).agg({
+            'is_present': 'mean'
+        }).reset_index()
+        topic_weekly_trend['brand_presence'] = topic_weekly_trend['is_present'] * 100
+        topic_weekly_trend = topic_weekly_trend.sort_values('analysis_date')
+        topic_weekly_trend = topic_weekly_trend.rename(columns={'analysis_date': 'week_start'})
+        
+        # Topic + LLM combination analysis
         topic_by_llm_data = {}
-        topic_rank_by_llm_data = {}
-        
-        if 'topic' in df.columns:
-            for llm in df['llm_name'].unique():
+        for llm in df['llm_name'].unique():
+            if pd.notna(llm):
+                llm_df = df[df['llm_name'] == llm]
                 topic_by_llm_data[llm] = {}
-                topic_rank_by_llm_data[llm] = {}
                 
-                for topic in df['topic'].unique():
-                    if pd.isna(topic):
-                        continue
-                    
-                    subset = df[(df['llm_name'] == llm) & (df['topic'] == topic)]
-                    if len(subset) == 0:
-                        continue
-                    
-                    # Presence by date
-                    topic_llm_trend = subset.groupby('analysis_date').agg({
-                        'is_present': 'mean'
-                    }).reset_index()
-                    topic_llm_trend = topic_llm_trend.sort_values('analysis_date')
-                    
-                    topic_by_llm_data[llm][topic] = {
-                        'dates': topic_llm_trend['analysis_date'].dt.strftime('%Y-%m-%d').tolist(),
-                        'presence': (topic_llm_trend['is_present'] * 100).round(1).tolist()
-                    }
-                    
-                    # Average rank by date (only when present)
-                    present_subset = subset[subset['is_present'] == True]
-                    if len(present_subset) > 0:
-                        rank_trend = present_subset.groupby('analysis_date').agg({
-                            'rank': 'mean'
+                for topic in llm_df['topic'].unique():
+                    if pd.notna(topic):
+                        topic_df = llm_df[llm_df['topic'] == topic]
+                        topic_trend = topic_df.groupby('analysis_date').agg({
+                            'is_present': 'mean'
                         }).reset_index()
-                        rank_trend = rank_trend.sort_values('analysis_date')
+                        topic_trend['brand_presence'] = topic_trend['is_present'] * 100
+                        topic_trend = topic_trend.sort_values('analysis_date')
                         
-                        topic_rank_by_llm_data[llm][topic] = {
-                            'dates': rank_trend['analysis_date'].dt.strftime('%Y-%m-%d').tolist(),
-                            'rank': rank_trend['rank'].round(2).tolist()
+                        topic_by_llm_data[llm][topic] = {
+                            'dates': topic_trend['analysis_date'].dt.strftime('%Y-%m-%d').tolist(),
+                            'presence': topic_trend['brand_presence'].tolist()
                         }
         
-        # Prepare chart data
-        chart_data = {
-            'overall_trend': {
-                'dates': weekly_trend['week_start'].dt.strftime('%Y-%m-%d').tolist(),
-                'presence': weekly_trend['brand_presence'].round(1).tolist()
-            },
-            'llm_trend': {},
-            'llm_rank_trend': {}
-        }
-        
+        # Topic + LLM rank analysis
+        topic_rank_by_llm_data = {}
         for llm in df['llm_name'].unique():
-            llm_data = llm_weekly_trend[llm_weekly_trend['llm_name'] == llm]
-            chart_data['llm_trend'][llm] = {
-                'dates': llm_data['week_start'].dt.strftime('%Y-%m-%d').tolist(),
-                'presence': llm_data['brand_presence'].round(1).tolist()
-            }
-            
-            llm_rank_data = llm_rank_trend[llm_rank_trend['llm_name'] == llm]
-            if len(llm_rank_data) > 0:
-                chart_data['llm_rank_trend'][llm] = {
-                    'dates': llm_rank_data['week_start'].dt.strftime('%Y-%m-%d').tolist(),
-                    'rank': llm_rank_data['rank'].round(2).tolist()
-                }
+            if pd.notna(llm):
+                llm_df = df[df['llm_name'] == llm]
+                topic_rank_by_llm_data[llm] = {}
+                
+                for topic in llm_df['topic'].unique():
+                    if pd.notna(topic):
+                        topic_df = llm_df[llm_df['topic'] == topic]
+                        topic_df = topic_df[topic_df['is_present'] == True]
+                        
+                        topic_rank_trend = topic_df.groupby('analysis_date').agg({
+                            'rank': 'mean'
+                        }).reset_index()
+                        topic_rank_trend = topic_rank_trend.sort_values('analysis_date')
+                        
+                        if len(topic_rank_trend) > 0:
+                            topic_rank_by_llm_data[llm][topic] = {
+                                'dates': topic_rank_trend['analysis_date'].dt.strftime('%Y-%m-%d').tolist(),
+                                'rank': topic_rank_trend['rank'].tolist()
+                            }
         
+        # Get all competitors from ordered_brands
+        all_competitors = set()
+        for _, row in df.iterrows():
+            if pd.notna(row.get('ordered_brands')):
+                try:
+                    brands = json.loads(row['ordered_brands'])
+                    all_competitors.update(brands)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        
+        # Remove the main brand if found
+        if brand_name:
+            all_competitors.discard(brand_name)
+        
+        all_competitors = sorted(list(all_competitors))
+        
+        # Competitor analysis data structure
+        competitor_data = {}
+        for competitor in all_competitors:
+            competitor_trends = {}
+            
+            for date in df['analysis_date'].unique():
+                date_df = df[df['analysis_date'] == date]
+                
+                competitor_count = 0
+                total_responses = 0
+                
+                for _, row in date_df.iterrows():
+                    if pd.notna(row.get('ordered_brands')):
+                        try:
+                            brands = json.loads(row['ordered_brands'])
+                            total_responses += 1
+                            if competitor in brands:
+                                competitor_count += 1
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                
+                if total_responses > 0:
+                    presence_pct = (competitor_count / total_responses) * 100
+                    competitor_trends[pd.Timestamp(date).strftime('%Y-%m-%d')] = presence_pct
+            
+            competitor_data[competitor] = competitor_trends
+        
+        # Prepare data for JSON serialization
         return {
-            'success': True,
             'brand_name': brand_name,
-            'current_presence': round(current_presence, 1),
-            'week_change': round(week_change, 1),
             'latest_date': latest_date.strftime('%Y-%m-%d') if latest_date else None,
-            'llm_metrics': llm_metrics,
-            'topic_metrics': topic_metrics,
-            'chart_data': chart_data,
+            'current_presence': float(current_presence),
+            'week_change': float(week_change),
+            'weekly_trend': {
+                'dates': weekly_trend['week_start'].dt.strftime('%Y-%m-%d').tolist(),
+                'presence': weekly_trend['brand_presence'].tolist()
+            },
+            'llm_weekly_trend': {
+                llm: {
+                    'dates': llm_weekly_trend[llm_weekly_trend['llm_name'] == llm]['week_start'].dt.strftime('%Y-%m-%d').tolist(),
+                    'presence': llm_weekly_trend[llm_weekly_trend['llm_name'] == llm]['brand_presence'].tolist()
+                }
+                for llm in llm_weekly_trend['llm_name'].unique()
+            },
+            'llm_rank_trend': {
+                llm: {
+                    'dates': llm_rank_trend[llm_rank_trend['llm_name'] == llm]['week_start'].dt.strftime('%Y-%m-%d').tolist(),
+                    'rank': llm_rank_trend[llm_rank_trend['llm_name'] == llm]['rank'].tolist()
+                }
+                for llm in llm_rank_trend['llm_name'].unique()
+            },
+            'latest_llm_breakdown': {
+                'llms': latest_llm_data['llm_name'].tolist() if not latest_llm_data.empty else [],
+                'presence': latest_llm_data['brand_presence'].tolist() if not latest_llm_data.empty else []
+            },
+            'latest_topic_breakdown': {
+                'topics': latest_topic_data['topic'].tolist() if not latest_topic_data.empty else [],
+                'presence': latest_topic_data['brand_presence'].tolist() if not latest_topic_data.empty else []
+            },
+            'topic_weekly_trend': {
+                topic: {
+                    'dates': topic_weekly_trend[topic_weekly_trend['topic'] == topic]['week_start'].dt.strftime('%Y-%m-%d').tolist(),
+                    'presence': topic_weekly_trend[topic_weekly_trend['topic'] == topic]['brand_presence'].tolist()
+                }
+                for topic in topic_weekly_trend['topic'].unique()
+            },
             'topic_by_llm_data': topic_by_llm_data,
             'topic_rank_by_llm_data': topic_rank_by_llm_data,
-            'available_dates': weekly_trend['week_start'].dt.strftime('%Y-%m-%d').tolist()
+            'available_dates': sorted(df['analysis_date'].dt.strftime('%Y-%m-%d').unique().tolist()),
+            'all_competitors': all_competitors,
+            'competitor_data': competitor_data
         }
         
     except Exception as e:
-        print(f"Error processing brand presence: {str(e)}")
+        print(f"Error processing brand presence file: {str(e)}")
         import traceback
         traceback.print_exc()
-        return {'success': False, 'error': str(e)}
+        raise
 
-def process_sources_file(file_path, file_type='full'):
-    """Process sources export files"""
+def process_sources_full(file_path):
+    """Process sources full export"""
     try:
         if file_path.endswith('.csv'):
             df = pd.read_csv(file_path)
         else:
             df = pd.read_excel(file_path)
         
-        print(f"Loaded {len(df)} rows from sources file ({file_type})")
-        
-        # Normalize LLM names
-        def normalize_llm_name(name):
-            if pd.isna(name):
-                return name
-            name_lower = str(name).lower().strip()
-            llm_mapping = {
-                'aio': 'Google AIO',
-                'google aio': 'Google AIO',
-                'chatgpt': 'ChatGPT',
-                'gemini': 'Gemini',
-                'perplexity': 'Perplexity'
-            }
-            return llm_mapping.get(name_lower, name)
-        
-        if 'llm_name' in df.columns:
-            df['llm_name'] = df['llm_name'].apply(normalize_llm_name)
+        print(f"Loaded {len(df)} rows from sources full file")
         
         # Convert date column
-        if 'analysis_date' in df.columns:
-            df['analysis_date'] = pd.to_datetime(df['analysis_date'])
+        df['week_start'] = pd.to_datetime(df['week_start'])
         
-        # Source type distribution
-        source_dist = {}
-        if 'source_type' in df.columns:
-            source_counts = df['source_type'].value_counts()
-            source_dist = {
-                'labels': source_counts.index.tolist(),
-                'values': source_counts.values.tolist()
-            }
+        # Basic stats
+        total_queries = len(df)
+        queries_with_sources = df['has_sources'].sum() if 'has_sources' in df.columns else 0
         
-        # LLM distribution
-        llm_dist = {}
-        if 'llm_name' in df.columns:
-            llm_counts = df['llm_name'].value_counts()
-            llm_dist = {
-                'labels': llm_counts.index.tolist(),
-                'values': llm_counts.values.tolist()
-            }
-        
-        # Top sources
-        top_sources = []
-        if 'source' in df.columns:
-            source_counts = df['source'].value_counts().head(10)
-            top_sources = [
-                {'source': src, 'count': int(count)}
-                for src, count in source_counts.items()
-            ]
+        # Weekly trend
+        weekly_stats = df.groupby('week_start').agg({
+            'has_sources': 'mean' if 'has_sources' in df.columns else lambda x: 0
+        }).reset_index()
+        weekly_stats['source_rate'] = weekly_stats.get('has_sources', 0) * 100
         
         return {
-            'success': True,
-            'total_sources': len(df),
-            'source_distribution': source_dist,
-            'llm_distribution': llm_dist,
-            'top_sources': top_sources
+            'total_queries': int(total_queries),
+            'queries_with_sources': int(queries_with_sources),
+            'weekly_trend': {
+                'dates': weekly_stats['week_start'].dt.strftime('%Y-%m-%d').tolist(),
+                'source_rate': weekly_stats['source_rate'].tolist()
+            }
         }
-        
     except Exception as e:
-        print(f"Error processing sources: {str(e)}")
-        return {'success': False, 'error': str(e)}
+        print(f"Error processing sources full file: {str(e)}")
+        raise
+
+def process_sources_detailed(file_path):
+    """Process sources detailed export"""
+    try:
+        if file_path.endswith('.csv'):
+            df = pd.read_csv(file_path)
+        else:
+            df = pd.read_excel(file_path)
+        
+        print(f"Loaded {len(df)} rows from sources detailed file")
+        
+        # Aggregate by domain
+        domain_stats = df.groupby('domain').agg({
+            'appearances': 'sum'
+        }).reset_index().sort_values('appearances', ascending=False).head(20)
+        
+        return {
+            'top_domains': {
+                'domains': domain_stats['domain'].tolist(),
+                'appearances': domain_stats['appearances'].tolist()
+            }
+        }
+    except Exception as e:
+        print(f"Error processing sources detailed file: {str(e)}")
+        raise
+
+def process_perception(file_path):
+    """Process perception analysis file"""
+    try:
+        if file_path.endswith('.csv'):
+            df = pd.read_csv(file_path)
+        else:
+            df = pd.read_excel(file_path)
+        
+        print(f"Loaded {len(df)} rows from perception file")
+        
+        # Convert date
+        df['week_start'] = pd.to_datetime(df['week_start'])
+        
+        # Sentiment analysis
+        sentiment_counts = df['sentiment'].value_counts().to_dict()
+        
+        # Weekly sentiment trend
+        weekly_sentiment = df.groupby(['week_start', 'sentiment']).size().reset_index(name='count')
+        weekly_sentiment_pivot = weekly_sentiment.pivot(
+            index='week_start', 
+            columns='sentiment', 
+            values='count'
+        ).fillna(0)
+        
+        return {
+            'sentiment_counts': sentiment_counts,
+            'weekly_sentiment': {
+                'dates': weekly_sentiment_pivot.index.strftime('%Y-%m-%d').tolist(),
+                'sentiments': {
+                    col: weekly_sentiment_pivot[col].tolist()
+                    for col in weekly_sentiment_pivot.columns
+                }
+            }
+        }
+    except Exception as e:
+        print(f"Error processing perception file: {str(e)}")
+        raise
 
 def process_citation_tracker(file_path):
     """Process citation tracker file"""
@@ -351,84 +431,29 @@ def process_citation_tracker(file_path):
         else:
             df = pd.read_excel(file_path)
         
-        print(f"Loaded {len(df)} rows from citation tracker")
+        print(f"Loaded {len(df)} rows from citation tracker file")
         
-        # Calculate citation metrics
+        # Convert date
+        df['week_start'] = pd.to_datetime(df['week_start'])
+        
+        # Citation stats
         total_citations = len(df)
+        unique_sources = df['domain'].nunique() if 'domain' in df.columns else 0
         
-        # If there's a date column, calculate trend
-        citation_trend = {}
-        if 'date' in df.columns or 'analysis_date' in df.columns:
-            date_col = 'date' if 'date' in df.columns else 'analysis_date'
-            df[date_col] = pd.to_datetime(df[date_col])
-            
-            daily_citations = df.groupby(date_col).size().reset_index(name='count')
-            daily_citations = daily_citations.sort_values(date_col)
-            
-            citation_trend = {
-                'dates': daily_citations[date_col].dt.strftime('%Y-%m-%d').tolist(),
-                'counts': daily_citations['count'].tolist()
+        # Weekly citation trend
+        weekly_citations = df.groupby('week_start').size().reset_index(name='count')
+        
+        return {
+            'total_citations': int(total_citations),
+            'unique_sources': int(unique_sources),
+            'weekly_citations': {
+                'dates': weekly_citations['week_start'].dt.strftime('%Y-%m-%d').tolist(),
+                'count': weekly_citations['count'].tolist()
             }
-            
-            # Latest week citations
-            if len(daily_citations) > 0:
-                latest_date = daily_citations[date_col].max()
-                week_ago = latest_date - timedelta(days=7)
-                latest_citations = len(df[df[date_col] >= week_ago])
-            else:
-                latest_citations = 0
-        else:
-            latest_citations = 0
-        
-        return {
-            'success': True,
-            'total_citations': total_citations,
-            'latest_citations': latest_citations,
-            'citation_trend': citation_trend
         }
-        
     except Exception as e:
-        print(f"Error processing citation tracker: {str(e)}")
-        return {'success': False, 'error': str(e)}
-
-def process_perception(file_path):
-    """Process brand perception file"""
-    try:
-        if file_path.endswith('.csv'):
-            df = pd.read_csv(file_path)
-        else:
-            df = pd.read_excel(file_path)
-        
-        print(f"Loaded {len(df)} rows from perception data")
-        
-        # Calculate overall perception score
-        if 'score' in df.columns:
-            overall_score = df['score'].mean()
-        else:
-            overall_score = None
-        
-        # Get attributes with scores
-        attributes = []
-        if 'attribute' in df.columns and 'score' in df.columns:
-            attr_scores = df.groupby('attribute')['score'].mean().reset_index()
-            attr_scores = attr_scores.sort_values('score', ascending=False)
-            
-            for _, row in attr_scores.iterrows():
-                attributes.append({
-                    'attribute': row['attribute'],
-                    'score': round(row['score'], 2),
-                    'change': 0  # Would need historical data to calculate
-                })
-        
-        return {
-            'success': True,
-            'overall_score': round(overall_score, 2) if overall_score else None,
-            'attributes': attributes
-        }
-        
-    except Exception as e:
-        print(f"Error processing perception data: {str(e)}")
-        return {'success': False, 'error': str(e)}
+        print(f"Error processing citation tracker file: {str(e)}")
+        raise
 
 def process_events_log(file_path):
     """Process events log file"""
@@ -438,105 +463,152 @@ def process_events_log(file_path):
         else:
             df = pd.read_excel(file_path)
         
-        print(f"Loaded {len(df)} rows from events log")
+        print(f"Loaded {len(df)} rows from events log file")
         
-        # Get recent events
-        events = []
-        if 'date' in df.columns and 'description' in df.columns:
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.sort_values('date', ascending=False)
-            
-            for _, row in df.head(20).iterrows():  # Get last 20 events
-                events.append({
-                    'date': row['date'].strftime('%Y-%m-%d'),
-                    'description': row['description']
-                })
+        # Convert date
+        df['date'] = pd.to_datetime(df['date'])
+        
+        # Sort by date
+        df = df.sort_values('date')
         
         return {
-            'success': True,
-            'events': events
+            'events': df.to_dict('records')
         }
-        
     except Exception as e:
-        print(f"Error processing events log: {str(e)}")
-        return {'success': False, 'error': str(e)}
+        print(f"Error processing events log file: {str(e)}")
+        raise
 
 # API Routes
-@app.route('/')
-def home():
-    return jsonify({
-        'message': 'AEO Dashboard API',
-        'status': 'running',
-        'endpoints': {
-            'upload': '/upload',
-            'data': '/data',
-            'reset': '/reset'
-        }
-    })
 
-@app.route('/upload', methods=['POST'])
-def upload_files():
-    """Handle file uploads"""
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy', 'message': 'AEO Dashboard API is running'})
+
+@app.route('/api/upload', methods=['POST', 'OPTIONS'])
+def upload_file():
+    """Upload and process data files"""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    
     try:
-        results = {}
+        file_type = request.form.get('file_type')
         
-        # Process each file type
-        file_types = {
-            'brand_presence': process_brand_presence,
-            'sources_full': lambda f: process_sources_file(f, 'full'),
-            'sources_detailed': lambda f: process_sources_file(f, 'detailed'),
-            'citation_tracker': process_citation_tracker,
-            'perception': process_perception,
-            'events_log': process_events_log
-        }
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
         
-        for file_key, process_func in file_types.items():
-            if file_key in request.files:
-                file = request.files[file_key]
-                if file and file.filename and allowed_file(file.filename):
-                    filename = secure_filename(file.filename)
-                    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-                    file.save(filepath)
-                    
-                    # Process the file
-                    result = process_func(filepath)
-                    processed_data[file_key] = result
-                    results[file_key] = {'uploaded': True, 'processed': result.get('success', False)}
+        file = request.files['file']
+        
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'Invalid file type. Only CSV and Excel files are allowed'}), 400
+        
+        # Save file
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        
+        # Process file based on type
+        if file_type == 'brand_presence':
+            processed_data['brand_presence'] = process_brand_presence(filepath)
+        elif file_type == 'sources_full':
+            processed_data['sources_full'] = process_sources_full(filepath)
+        elif file_type == 'sources_detailed':
+            processed_data['sources_detailed'] = process_sources_detailed(filepath)
+        elif file_type == 'perception':
+            processed_data['perception'] = process_perception(filepath)
+        elif file_type == 'citation_tracker':
+            processed_data['citation_tracker'] = process_citation_tracker(filepath)
+        elif file_type == 'events_log':
+            processed_data['events_log'] = process_events_log(filepath)
+        else:
+            return jsonify({'error': 'Invalid file type'}), 400
+        
+        # Clean up file
+        os.remove(filepath)
         
         return jsonify({
             'success': True,
-            'results': results
+            'message': f'{file_type} file processed successfully',
+            'file_type': file_type
         })
         
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/data', methods=['GET'])
-def get_data():
-    """Return all processed data"""
+@app.route('/api/data/brand_presence', methods=['GET'])
+def get_brand_presence():
+    """Get brand presence data"""
+    if processed_data['brand_presence'] is None:
+        return jsonify({'error': 'No brand presence data available'}), 404
+    
+    return jsonify(processed_data['brand_presence'])
+
+@app.route('/api/data/sources_full', methods=['GET'])
+def get_sources_full():
+    """Get sources full data"""
+    if processed_data['sources_full'] is None:
+        return jsonify({'error': 'No sources full data available'}), 404
+    
+    return jsonify(processed_data['sources_full'])
+
+@app.route('/api/data/sources_detailed', methods=['GET'])
+def get_sources_detailed():
+    """Get sources detailed data"""
+    if processed_data['sources_detailed'] is None:
+        return jsonify({'error': 'No sources detailed data available'}), 404
+    
+    return jsonify(processed_data['sources_detailed'])
+
+@app.route('/api/data/perception', methods=['GET'])
+def get_perception():
+    """Get perception data"""
+    if processed_data['perception'] is None:
+        return jsonify({'error': 'No perception data available'}), 404
+    
+    return jsonify(processed_data['perception'])
+
+@app.route('/api/data/citation_tracker', methods=['GET'])
+def get_citation_tracker():
+    """Get citation tracker data"""
+    if processed_data['citation_tracker'] is None:
+        return jsonify({'error': 'No citation tracker data available'}), 404
+    
+    return jsonify(processed_data['citation_tracker'])
+
+@app.route('/api/data/events_log', methods=['GET'])
+def get_events_log():
+    """Get events log data"""
+    if processed_data['events_log'] is None:
+        return jsonify({'error': 'No events log data available'}), 404
+    
+    return jsonify(processed_data['events_log'])
+
+@app.route('/api/data/all', methods=['GET'])
+def get_all_data():
+    """Get all available data"""
     return jsonify({
-        'success': True,
-        'data': processed_data
+        'brand_presence': processed_data['brand_presence'],
+        'sources_full': processed_data['sources_full'],
+        'sources_detailed': processed_data['sources_detailed'],
+        'perception': processed_data['perception'],
+        'citation_tracker': processed_data['citation_tracker'],
+        'events_log': processed_data['events_log']
     })
 
-@app.route('/reset', methods=['POST'])
-def reset_data():
-    """Reset all processed data"""
-    global processed_data
-    processed_data = {
-        'brand_presence': None,
-        'sources_full': None,
-        'sources_detailed': None,
-        'sources_combined': None,
-        'perception': None,
-        'citation_tracker': None,
-        'events_log': None
-    }
-    return jsonify({'success': True, 'message': 'Data reset successfully'})
+@app.route('/api/data/status', methods=['GET'])
+def get_data_status():
+    """Get status of all data sources"""
+    return jsonify({
+        'brand_presence': processed_data['brand_presence'] is not None,
+        'sources_full': processed_data['sources_full'] is not None,
+        'sources_detailed': processed_data['sources_detailed'] is not None,
+        'perception': processed_data['perception'] is not None,
+        'citation_tracker': processed_data['citation_tracker'] is not None,
+        'events_log': processed_data['events_log'] is not None
+    })
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(debug=True, host='0.0.0.0', port=5000)
