@@ -122,6 +122,14 @@ def process_brand_presence(file_path):
         df['week_start'] = df['analysis_date']
         df['is_present'] = df['is_present'].astype(bool)
         
+        # Handle topic column naming - rename topic_name to topic if it exists
+        if 'topic_name' in df.columns and 'topic' not in df.columns:
+            df['topic'] = df['topic_name']
+            print("Renamed 'topic_name' column to 'topic'")
+        elif 'topic' not in df.columns:
+            print("Warning: No 'topic' or 'topic_name' column found. Adding default 'General' topic.")
+            df['topic'] = 'General'
+        
         # Overall daily trend
         weekly_trend = df.groupby('analysis_date').agg({
             'is_present': 'mean'
